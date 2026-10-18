@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: "Segoe UI", "Hiragino Sans", sans-serif; margin: 0; background: #111; color: #fff; }
+  .wrap { padding: 12px; }
+  .meta { opacity: .85; font-size: 14px; margin-bottom: 8px; }
+  .step-no { color: #8fd9a8; font-size: 18px; font-weight: 700; }
+  .step-text {
+    font-size: 34px; line-height: 1.4; font-weight: 800; margin: 12px 0 16px;
+    min-height: 120px;
+  }
+  .ings { background: #1c1c1c; border-radius: 12px; padding: 10px 12px; font-size: 15px; margin-bottom: 12px; }
+  .btns { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  button {
+    font-size: 18px; font-weight: 800; padding: 16px 8px; min-height: 64px;
+    border: none; border-radius: 14px; cursor: pointer;
+  }
+  .nav { background: #2d8a57; color: #fff; }
+  .speak { background: #f0c14b; color: #222; }
+  .timer { background: #3d7ea6; color: #fff; }
+  .ask { background: #8e44ad; color: #fff; }
+  .mic { background: #c0392b; color: #fff; grid-column: 1 / -1; }
+  .mic.on { background: #27ae60; }
+  .dish { background: #5a4a8a; color: #fff; }
+  #timerBox { font-size: 28px; font-weight: 800; text-align: center; margin: 10px 0; color: #f7d774; min-height: 36px; }
+  #status { font-size: 14px; opacity: .9; margin-top: 8px; word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="meta" id="meta"></div>
+  <div class="step-no" id="stepNo"></div>
+  <div class="step-text" id="stepText"></div>
+  <div class="ings" id="ings"></div>
+  <div id="timerBox"></div>
+  <div class="btns">
+    <button class="nav" id="prev">⬅️ 前へ</button>
+    <button class="speak" id="repeat">🔊 読み上げ</button>
+    <button class="nav" id="next">次へ ➡️</button>
+    <button class="timer" id="t3">⏱️ 3分タイマー</button>
+    <button class="ask" id="ask">❓ AIに質問</button>
+    <button class="mic" id="mic">🎤 音声コマンドON</button>
+  </div>
+  <div class="btns" id="dishBtns"></div>
+  <div id="status">🔊 読み上げ を押すと日本語で手順を読み上げます。</div>
+</div>
+<script>
+  const Streamlit = {
+    setComponentReady: function () {
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+    },
+    setFrameHeight: function (height) {
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: height }, "*");
+    },
+    setComponentValue: function (value) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: value,
+        dataType: "json"
+      }, "*");
+    }
+  };
+
+  let DATA = {
+    name: "レシピ",
+    steps: ["手順が登録されていません"],
+    speech_steps: [],
+    step_roles: [],
+    dish_slots: [],
+    ingredients: [],
+    servings: "2人分",
+    initialStep: 0,
+    scale: 1,
+    aiAnswer: "",
+    speakId: ""
+  };
+  let step = 0;
+  let scale = 1;
+  let rec = null;
+  let listening = false;
+  let speaking = false;
+  let awaitingQuestion = false;
+  let timerId = null;
+  let remain = 0;
+  let jaVoice = null;
+  let lastSpokenId = "";
+  let audioCtx = null;
+  let alarmTimer = null;
+
+  function setStatus(t) {
+    const el = document.getElementById("status");
+    if (el) el.textContent = t;
+  }
+
+  function origServings() {
+    const s = String(DATA.servings || "2");
+    const nums = s.match(/\d+/g);
+    if (nums && nums.length >= 2) return (Number(nums[0]) + Number(nums[1])) / 2;
+    if (nums) return Number(nums[0]);
+    return 2;
+  }
+  function fmtQty(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return String(v);
+    if (Math.abs(n - Math.round(n)) < 1e-6) return String(Math.round(n));
+    return String(Math.round(n * 100) / 100);
+  }
+  function saveState() {
+    sessionStorage.setItem("cook_recipe", DATA.name);
+    sessionStorage.setItem("cook_step", String(step));
+    sessionStorage.setItem("cook_scale", String(scale));
+  }
+  function restoreState() {
+    if (DATA.fromAi) {
+      step = DATA.initialStep || 0;
+      scale = DATA.scale || 1;
+      return;
+    }
+    if (sessionStorage.getItem("cook_recipe") === DATA.name) {
+      const s = parseInt(sessionStorage.getItem("cook_step") || "0", 10);
+      const sc = parseFloat(sessionStorage.getItem("cook_scale") || "1");
+      if (!isNaN(s)) step = s;
+      if (!isNaN(sc) && sc > 0) scale = sc;
+    } else {
+      step = DATA.initialStep || 0;
+      scale = DATA.scale || 1;
+    }
+  }
+  function currentPeople() {
+    return Math.max(0.25, origServings() * scale);
+  }
+  function roleLabel(role) {
+    if (role === "main") return "主菜";
+    if (role === "side") return "副菜";
+    return role || "";
+  }
+  function roleMatches(role, slot) {
+    const lab = roleLabel(role);
+    return role === slot || lab === slot ||
+      (slot === "主菜" && role === "main") ||
+      (slot === "副菜" && role === "side");
+  }
+  function knownSlots() {
+    const fromData = DATA.dish_slots || [];
+    if (fromData.length) return fromData;
+    const seen = [];
+    (DATA.step_roles || []).forEach(function (r) {
+      const lab = roleLabel(r);
+      if (lab && seen.indexOf(lab) < 0) seen.push(lab);
+    });
+    return seen;
+  }
+  function yomiForSlot(slot) {
+    const map = {
+      "主食": "しゅしょく。",
+      "主菜": "しゅさい。",
+      "副菜": "ふくさい。",
+      "汁物": "しるもの。",
+      "付け合わせ": "つけあわせ。",
+      "デザート": "でざーと。"
+    };
+    return map[slot] || "";
+  }
+  function renderDishJumpButtons() {
+    const host = document.getElementById("dishBtns");
+    if (!host) return;
+    host.innerHTML = "";
+    knownSlots().forEach(function (slot) {
+      const b = document.createElement("button");
+      b.className = "dish";
+      b.textContent = slot + "へ";
+      b.onclick = function () { unlockAudio(); jumpToRole(slot); };
+      host.appendChild(b);
+    });
+  }
+  function ingsHtml() {
+    const role = (DATA.step_roles || [])[step] || "";
+    const lab = roleLabel(role);
+    const filtered = (DATA.ingredients || []).filter(function (ing) {
+      if (!role || !ing.dish) return true;
+      return roleMatches(ing.dish, lab) || ing.dish === role;
+    });
+    const rows = filtered.map(function (ing) {
+      const qty = Number(ing.used_quantity);
+      const shown = isFinite(qty) ? fmtQty(qty * scale) : (ing.display_amount || "");
+      const unitHint = ing.display_amount ? "（目安: " + ing.display_amount + "）" : "";
+      return "・" + (ing.name || "") + " " + shown + unitHint;
+    });
+    const title = lab
+      ? lab + "の材料（" + fmtQty(currentPeople()) + "人分換算）"
+      : "材料（" + fmtQty(currentPeople()) + "人分換算）";
+    return title + "<br>" + (rows.join("<br>") || "なし");
+  }
+  function render() {
+    const steps = DATA.steps || ["手順がありません"];
+    if (step < 0) step = 0;
+    if (step >= steps.length) step = steps.length - 1;
+    const role = (DATA.step_roles || [])[step] || "";
+    const lab = roleLabel(role);
+    document.getElementById("meta").textContent = DATA.name + " ／ 人数: " + DATA.servings;
+    document.getElementById("stepNo").textContent =
+      (lab ? "【" + lab + "】 " : "") + "手順 " + (step + 1) + " / " + steps.length;
+    document.getElementById("stepText").textContent = steps[step];
+    document.getElementById("ings").innerHTML = ingsHtml();
+    renderDishJumpButtons();
+    saveState();
+    Streamlit.setFrameHeight(Math.max(720, document.body.scrollHeight + 24));
+  }
+
+  function pickJaVoice() {
+    const voices = window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
+    const normalized = voices.filter(function (v) {
+      const lang = String(v.lang || "").replace("_", "-").toLowerCase();
+      return lang === "ja-jp" || lang.startsWith("ja");
+    });
+    const preferred = normalized.find(function (v) {
+      return /google|nanami|haruka|ayumi|ichiro|kyoko|japanese/i.test(v.name || "");
+    });
+    jaVoice = preferred || normalized[0] || null;
+    return jaVoice;
+  }
+
+  function onVoicesChanged() {
+    pickJaVoice();
+    const all = (window.speechSynthesis.getVoices() || []).map(function (v) {
+      return (v.lang || "") + ":" + (v.name || "");
+    });
+    setStatus(
+      "音声リスト更新: " +
+      (jaVoice ? (jaVoice.name + " (" + jaVoice.lang + ")") : "日本語音声なし") +
+      " / 件数=" + all.length
+    );
+  }
+
+  function formatTextForSpeech(text) {
+    let s = String(text || "");
+    const pairs = [
+      ["分量外", "ぶんりょうがい"],
+      ["大さじ", "おおさじ"],
+      ["小さじ", "こさじ"],
+      ["中火", "ちゅうび"],
+      ["強火", "つよび"],
+      ["弱火", "よわび"],
+      ["少々", "しょうしょう"],
+      ["適量", "てきりょう"],
+      ["ひとつまみ", "ひとつまみ"],
+      ["1/2", "にぶんのいち"],
+      ["１/２", "にぶんのいち"],
+      ["1／2", "にぶんのいち"],
+      ["１／２", "にぶんのいち"],
+      ["1/4", "よんぶんのいち"],
+      ["１/４", "よんぶんのいち"],
+      ["1／4", "よんぶんのいち"],
+      ["１／４", "よんぶんのいち"],
+      ["½", "にぶんのいち"],
+      ["¼", "よんぶんのいち"]
+    ];
+    for (let i = 0; i < pairs.length; i++) {
+      s = s.split(pairs[i][0]).join(pairs[i][1]);
+    }
+    s = s.replace(/([0-9０-９]+)[/／]([0-9０-９]+)/g, function (_, a, b) {
+      const n = { "0": "ゼロ", "1": "いち", "2": "に", "3": "さん", "4": "よん", "5": "ご", "6": "ろく", "7": "なな", "8": "はち", "9": "きゅう",
+                  "０": "ゼロ", "１": "いち", "２": "に", "３": "さん", "４": "よん", "５": "ご", "６": "ろく", "７": "なな", "８": "はち", "９": "きゅう" };
+      const toYomi = function (num) {
+        return String(num).split("").map(function (ch) { return n[ch] || ch; }).join("");
+      };
+      return toYomi(b) + "ぶんの" + toYomi(a);
+    });
+    s = s.replace(/火/g, "ひ");
+    return s;
+  }
+
+  function speak(text, after) {
+    if (!text) {
+      setStatus("読み上げテキストが空です");
+      if (after) after();
+      return;
+    }
+    if (!window.speechSynthesis) {
+      setStatus("このブラウザは音声合成に未対応です");
+      if (after) after();
+      return;
+    }
+    const spoken = formatTextForSpeech(text);
+    speaking = true;
+    pauseRec();
+    window.speechSynthesis.cancel();
+    const uttr = new SpeechSynthesisUtterance(spoken);
+    uttr.lang = "ja-JP";
+    uttr.rate = 1.0;
+    uttr.pitch = 1.0;
+    const voice = pickJaVoice();
+    if (voice) {
+      uttr.voice = voice;
+      uttr.lang = voice.lang || "ja-JP";
+    }
+    uttr.onstart = function () {
+      speaking = true;
+      setStatus("読み上げ開始 (" + (voice ? voice.name : "default") + "): " + spoken.slice(0, 48));
+    };
+    uttr.onend = function () {
+      speaking = false;
+      setStatus("読み上げ終了");
+      resumeRec();
+      if (after) after();
+    };
+    uttr.onerror = function (e) {
+      speaking = false;
+      setStatus("読み上げエラー: " + ((e && e.error) || "unknown"));
+      resumeRec();
+      if (after) after();
+    };
+    window.speechSynthesis.speak(uttr);
+    try { window.speechSynthesis.resume(); } catch (err) {}
+  }
+
+  setInterval(function () {
+    if (window.speechSynthesis && window.speechSynthesis.speaking && window.speechSynthesis.paused) {
+      try { window.speechSynthesis.resume(); } catch (err) {}
+    }
+  }, 250);
+
+  function speechForStep(i) {
+    const speechSteps = DATA.speech_steps || [];
+    const sp = speechSteps[i];
+    if (sp && String(sp).trim()) return String(sp).trim();
+    const steps = DATA.steps || [];
+    return formatTextForSpeech(steps[i] || "");
+  }
+
+  function speakStep() {
+    const n = step + 1;
+    const role = (DATA.step_roles || [])[step] || "";
+    const prefix = yomiForSlot(roleLabel(role));
+    speak(prefix + "てじゅん" + n + "。" + speechForStep(step));
+  }
+  function jumpToRole(slot) {
+    const roles = DATA.step_roles || [];
+    let idx = -1;
+    for (let i = 0; i < roles.length; i++) {
+      if (roleMatches(roles[i], slot)) { idx = i; break; }
+    }
+    if (idx < 0) {
+      speak(slot + "の手順がありません。");
+      return;
+    }
+    step = idx;
+    render();
+    speakStep();
+  }
+  function nextStep() {
+    if (step < (DATA.steps || []).length - 1) {
+      step += 1;
+      render();
+      speakStep();
+    } else speak("これが最後の手順です。");
+  }
+  function prevStep() {
+    if (step > 0) {
+      step -= 1;
+      render();
+      speakStep();
+    } else speak("これが最初の手順です。");
+  }
+  function unlockAudio() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+    } catch (e) {}
+  }
+
+  function beepOnce(freq) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = "square";
+    osc.frequency.value = freq || 880;
+    const now = audioCtx.currentTime;
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.25, now + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
+    osc.connect(g);
+    g.connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.4);
+  }
+
+  function playAlarm() {
+    unlockAudio();
+    if (alarmTimer) clearInterval(alarmTimer);
+    let n = 0;
+    beepOnce(880);
+    beepOnce(1174);
+    alarmTimer = setInterval(function () {
+      n += 1;
+      beepOnce(n % 2 ? 880 : 1174);
+      if (n >= 8) {
+        clearInterval(alarmTimer);
+        alarmTimer = null;
+      }
+    }, 400);
+    try { navigator.vibrate([400, 120, 400, 120, 700, 120, 900]); } catch (e) {}
+    const box = document.getElementById("timerBox");
+    if (box) {
+      box.style.color = "#ff4d4d";
+      box.textContent = "⏰ タイマー終了！";
+    }
+  }
+
+  function tick() {
+    remain -= 1;
+    if (remain <= 0) {
+      clearInterval(timerId); timerId = null;
+      remain = 0;
+      playAlarm();
+      speak("タイマーが終了しました。");
+      return;
+    }
+    const m = Math.floor(remain / 60);
+    const s = remain % 60;
+    const box = document.getElementById("timerBox");
+    box.style.color = "#f7d774";
+    box.textContent = "⏱️ " + m + "分" + String(s).padStart(2, "0") + "秒";
+  }
+  function startTimer(sec) {
+    unlockAudio();
+    if (timerId) clearInterval(timerId);
+    if (alarmTimer) clearInterval(alarmTimer);
+    remain = Math.max(1, parseInt(sec, 10) || 1);
+    const m = Math.floor(remain / 60);
+    const s = remain % 60;
+    document.getElementById("timerBox").style.color = "#f7d774";
+    document.getElementById("timerBox").textContent =
+      "⏱️ " + m + "分" + String(s).padStart(2, "0") + "秒";
+    timerId = setInterval(tick, 1000);
+    speak((m ? m + "分" : "") + (s ? s + "秒" : "") + "のタイマーを開始します。");
+  }
+  function applyScale(newScale, label) {
+    scale = newScale;
+    render();
+    const names = (DATA.ingredients || []).map(function (ing) {
+      const qty = Number(ing.used_quantity);
+      return (ing.name || "") + (isFinite(qty) ? fmtQty(qty * scale) : "");
+    }).join("、");
+    speak(label + "に変更しました。材料は、" + names + "です。");
+  }
+  function sendToPython(payload) {
+    Streamlit.setComponentValue(payload);
+  }
+  function sendSpeechToPython(raw) {
+    sendToPython({
+      kind: "speech",
+      text: raw,
+      step: step,
+      scale: scale,
+      ts: Date.now()
+    });
+  }
+  function askAI(question) {
+    const text = String(question || "").trim();
+    if (!text) return;
+    setStatus("AIに質問を送信: " + text);
+    sendToPython({
+      kind: "ai",
+      text: text,
+      step: step,
+      scale: scale,
+      ts: Date.now()
+    });
+  }
+  function pauseRec() {
+    if (rec && listening) {
+      try { rec.stop(); } catch (e) {}
+    }
+  }
+  function resumeRec() {
+    if (!listening || !rec || speaking) return;
+    try { rec.start(); } catch (e) {}
+  }
+  function normalizeCmd(raw) {
+    return String(raw || "")
+      .replace(/[\s　]/g, "")
+      .replace(/[。、．，,.！!？?～〜・「」『』（）()]/g, "")
+      .replace(/ください|下さい|お願いします|お願いしま|お願い|してください/g, "");
+  }
+
+  function looksLikeQuestion(t) {
+    return /量|代わり|代用|だっけ|教えて|何使える|どうすれば|足り|少な|多すぎ|レシピ|材料は|質問/.test(t);
+  }
+
+  function handleCommand(raw) {
+    const t = normalizeCmd(raw);
+    if (!t) return;
+    setStatus("認識: " + raw + " → " + t);
+
+    if (awaitingQuestion && looksLikeQuestion(t)) {
+      awaitingQuestion = false;
+      askAI(raw);
+      return;
+    }
+    awaitingQuestion = false;
+
+    if (/タイマー.{0,8}(止め|停止|キャンセル|解除|消し)|(止め|停止|キャンセル).{0,8}タイマー|タイマーストップ/.test(t)) {
+      if (timerId) { clearInterval(timerId); timerId = null; }
+      if (alarmTimer) { clearInterval(alarmTimer); alarmTimer = null; }
+      remain = 0;
+      document.getElementById("timerBox").textContent = "タイマー停止";
+      speak("タイマーを停止しました。");
+      sendSpeechToPython(raw);
+      return;
+    }
+
+    let m = t.match(/(\d+(?:\.\d+)?)分(\d+(?:\.\d+)?)秒/);
+    if (m && /タイマー|測|はか|セット|カウント/.test(t)) {
+      startTimer(Math.round(Number(m[1]) * 60 + Number(m[2])));
+      sendSpeechToPython(raw);
+      return;
+    }
+    m = t.match(/(\d+(?:\.\d+)?)分(?:間)?(?:の)?タイマー/) || t.match(/タイマー.*?(\d+(?:\.\d+)?)分/);
+    if (!m && /タイマー|測って|はかって|セット/.test(t)) m = t.match(/(\d+(?:\.\d+)?)分/);
+    if (m) {
+      startTimer(Math.round(Number(m[1]) * 60));
+      sendSpeechToPython(raw);
+      return;
+    }
+    m = t.match(/(\d+)秒(?:間)?(?:の)?タイマー/) || t.match(/タイマー.*?(\d+)秒/);
+    if (!m && /タイマー|測って|はかって|セット/.test(t)) m = t.match(/(\d+)秒/);
+    if (m) {
+      startTimer(Number(m[1]));
+      sendSpeechToPython(raw);
+      return;
+    }
+
+    if (/もう一度|もういちど|もういっかい|もう一回|もっかい|リピート|繰り返|読み上げ/.test(t) && !looksLikeQuestion(t)) {
+      speakStep();
+      return;
+    }
+    if (!looksLikeQuestion(t)) {
+      const jumpSpecs = [
+        { slot: "付け合わせ", re: /付け合わせ|つけあわせ/ },
+        { slot: "デザート", re: /デザート|スイーツ|でざーと|デザート/ },
+        { slot: "汁物", re: /汁物|しるもの|スープ/ },
+        { slot: "主食", re: /主食|しゅしょく|ごはん|ご飯/ },
+        { slot: "副菜", re: /副菜|ふくさい/ },
+        { slot: "主菜", re: /主菜|しゅさい|メイン/ }
+      ];
+      for (let i = 0; i < jumpSpecs.length; i++) {
+        if (jumpSpecs[i].re.test(t) && knownSlots().indexOf(jumpSpecs[i].slot) >= 0) {
+          jumpToRole(jumpSpecs[i].slot);
+          return;
+        }
+      }
+    }
+    if (
+      /つぎへ|つぎに|つぎい|つぎのてじゅん|つぎのステップ|次へ|次に|次い|次の手順|次のステップ|進む|進んで|すすむ|すすんで|ネクスト/.test(t) ||
+      t === "つぎ" || t === "次" || t === "next"
+    ) {
+      if (!looksLikeQuestion(t)) { nextStep(); return; }
+    }
+    if (
+      /まえへ|まえに|前へ|前に|前の手順|戻る|もどる|もどって|戻って|バック/.test(t) ||
+      t === "まえ" || t === "前" || t === "back"
+    ) {
+      if (!looksLikeQuestion(t)) { prevStep(); return; }
+    }
+    if (/半分/.test(t) && /量|人分|して/.test(t)) { applyScale(0.5, "半分の量"); return; }
+    m = t.match(/(\d+(?:\.\d+)?)人分/);
+    if (m && /して|変更|に/.test(t)) {
+      const target = Number(m[1]);
+      applyScale(target / origServings(), target + "人分");
+      return;
+    }
+    if (looksLikeQuestion(t)) {
+      askAI(raw);
+      return;
+    }
+    setStatus("コマンド未検出: " + raw + "（次へ／前へ／もう一度／○分タイマー が使えます）");
+  }
+  function startMic() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { setStatus("このブラウザは音声認識未対応です。Chromeをご利用ください。"); return; }
+    if (!rec) {
+      rec = new SR();
+      rec.lang = "ja-JP";
+      rec.continuous = true;
+      rec.interimResults = false;
+      rec.onresult = function (e) {
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          if (!e.results[i].isFinal) continue;
+          const t = e.results[i][0].transcript;
+          if (!speaking) handleCommand(t);
+        }
+      };
+      rec.onend = function () {
+        if (listening && !speaking) {
+          try { rec.start(); } catch (e) {}
+        }
+      };
+      rec.onerror = function (e) { setStatus("マイク: " + e.error); };
+    }
+    listening = true;
+    unlockAudio();
+    document.getElementById("mic").textContent = "🎤 音声コマンドOFF（聞き取り中）";
+    document.getElementById("mic").classList.add("on");
+    try { rec.start(); } catch (e) {}
+    setStatus("音声コマンド待ち。次へ、前へ、品目名へ、読み上げ、3分タイマー、質問 が使えます。");
+  }
+  function stopMic() {
+    listening = false;
+    document.getElementById("mic").textContent = "🎤 音声コマンドON";
+    document.getElementById("mic").classList.remove("on");
+    try { rec && rec.stop(); } catch (e) {}
+    setStatus("音声コマンドを停止しました。");
+  }
+
+  document.getElementById("prev").onclick = function () { unlockAudio(); prevStep(); };
+  document.getElementById("next").onclick = function () { unlockAudio(); nextStep(); };
+  document.getElementById("repeat").onclick = function () { unlockAudio(); speakStep(); };
+  document.getElementById("t3").onclick = function () {
+    unlockAudio();
+    startTimer(180);
+    sendSpeechToPython("3分タイマー");
+  };
+  document.getElementById("ask").onclick = function () {
+    unlockAudio();
+    awaitingQuestion = true;
+    startMic();
+    speak("はい、どうぞ。質問してください。");
+  };
+  document.getElementById("mic").onclick = function () {
+    unlockAudio();
+    if (listening) stopMic();
+    else { startMic(); speakStep(); }
+  };
+
+  if (window.speechSynthesis) {
+    if (typeof window.speechSynthesis.onvoiceschanged !== "undefined") {
+      window.speechSynthesis.onvoiceschanged = onVoicesChanged;
+    }
+    pickJaVoice();
+  }
+
+  function onRender(event) {
+    const args = (event.data && event.data.args) || {};
+    DATA = Object.assign({}, DATA, args);
+    restoreState();
+    render();
+    if (DATA.aiAnswer && DATA.speakId && DATA.speakId !== lastSpokenId) {
+      lastSpokenId = DATA.speakId;
+      speak(DATA.aiAnswer);
+    }
+  }
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.type === "streamlit:render") onRender(event);
+  });
+
+  Streamlit.setComponentReady();
+  Streamlit.setFrameHeight(760);
+</script>
+</body>
+</html>

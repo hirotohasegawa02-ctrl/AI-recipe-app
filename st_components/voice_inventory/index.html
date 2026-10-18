@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: "Segoe UI", "Hiragino Sans", sans-serif; margin: 0; background: #f7faf7; }
+  .box { border: 2px dashed #3d8b5f; border-radius: 16px; padding: 16px; background: #fff; }
+  h3 { margin: 0 0 8px; font-size: 18px; }
+  .hint { color: #4a5c4f; font-size: 13px; margin-bottom: 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font-size: 16px; padding: 12px 16px; border: none; border-radius: 12px;
+    cursor: pointer; font-weight: 700;
+  }
+  #start { background: #2d8a57; color: #fff; }
+  #stop { background: #c0392b; color: #fff; }
+  #send { background: #1f6feb; color: #fff; }
+  #live {
+    margin-top: 12px; min-height: 64px; padding: 12px; border-radius: 10px;
+    background: #eef6f0; font-size: 18px; line-height: 1.5;
+  }
+  .status { margin-top: 8px; font-size: 13px; color: #2d5a3d; word-break: break-all; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h3>🎙️ 音声で入力</h3>
+    <div class="hint">マイクを押して「牛肉300グラムと玉ねぎ2個と人参1本を買ったよ」のように話してください。認識が終わると自動でAI解析へ送ります。</div>
+    <div class="row">
+      <button id="start">🎙️ マイク開始</button>
+      <button id="stop">⏹️ 停止して送信</button>
+      <button id="send">🪄 この内容をAIへ送る</button>
+    </div>
+    <div id="live">（ここに認識テキストがリアルタイム表示されます）</div>
+    <div class="status" id="status">待機中</div>
+  </div>
+<script>
+  const Streamlit = {
+    setComponentReady: function () {
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+    },
+    setFrameHeight: function (height) {
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: height }, "*");
+    },
+    setComponentValue: function (value) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: value,
+        dataType: "json"
+      }, "*");
+    }
+  };
+
+  const live = document.getElementById("live");
+  const statusEl = document.getElementById("status");
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let rec = null;
+  let finalText = "";
+  let lastSent = "";
+
+  function setStatus(t) { statusEl.textContent = t; }
+
+  function currentTranscript() {
+    const shown = (live.textContent || "").trim();
+    const text = (finalText || "").trim() || shown;
+    if (!text || text.startsWith("（")) return "";
+    return text;
+  }
+
+  function sendToPython(transcript, phase) {
+    const text = String(transcript || "").trim();
+    if (!text) {
+      setStatus(phase + ": 送信するテキストが空です");
+      return;
+    }
+    lastSent = text;
+    Streamlit.setComponentValue({
+      text: text,
+      ts: Date.now(),
+      phase: phase
+    });
+    setStatus("Pythonへ送信済み(" + phase + "): " + text);
+  }
+
+  if (!SR) {
+    setStatus("このブラウザは音声認識に未対応です。Chrome をご利用ください。");
+  } else {
+    rec = new SR();
+    rec.lang = "ja-JP";
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onresult = function (e) {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t;
+        else interim += t;
+      }
+      const shown = (finalText + interim).trim() || "（聞き取り中…）";
+      live.textContent = shown;
+      const last = e.results[e.results.length - 1];
+      if (last && last.isFinal) {
+        sendToPython(finalText.trim(), "onresult");
+      }
+    };
+    rec.onerror = function (e) {
+      setStatus("認識エラー: " + e.error);
+    };
+    rec.onend = function () {
+      const text = currentTranscript();
+      if (text) sendToPython(text, "onend");
+      else setStatus("停止しました");
+    };
+  }
+
+  document.getElementById("start").onclick = function () {
+    if (!rec) return;
+    finalText = "";
+    lastSent = "";
+    live.textContent = "聞いています…";
+    setStatus("録音中。話し終わったら停止を押してください。");
+    try { rec.start(); } catch (err) { setStatus("開始エラー: " + err); }
+  };
+  document.getElementById("stop").onclick = function () {
+    if (rec) {
+      try { rec.stop(); } catch (err) {}
+    }
+  };
+  document.getElementById("send").onclick = function () {
+    sendToPython(currentTranscript(), "manual");
+  };
+
+  Streamlit.setComponentReady();
+  Streamlit.setFrameHeight(Math.max(280, document.body.scrollHeight + 20));
+</script>
+</body>
+</html>
